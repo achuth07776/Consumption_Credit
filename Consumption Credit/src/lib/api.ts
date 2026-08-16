@@ -22,8 +22,8 @@ export type TxStatus = "INITIATED" | "PENDING_CONFIRMATION" | "SETTLED" | "CANCE
 export type TxMode = "OWN_MONEY" | "CREDIT_LINE";
 
 export interface User { id: string; name: string; upiVpa: string; kycStatus: string; createdAt: string }
-export interface CreditLine { id: string; userId: string; lenderId: string; lenderName: string; limit: number; utilized: number; heldAmount: number; status: "ACTIVE" | "SUSPENDED"; interestRate: number }
-export interface Transaction { id: string; userId: string; creditLineId: string; lenderId: string; merchantName: string; amount: number; mode: TxMode; channel: "UPI" | "BNPL"; status: TxStatus; pendingSince?: string; settledAt?: string; cancelledAt?: string; createdAt: string; routingAttempts?: RoutingAttempt[] }
+export interface CreditLine { id: string; userId: string; lenderId: string; lenderName: string; limit: number; utilized: number; heldAmount: number; status: "ACTIVE" | "SUSPENDED" | "CLOSED"; interestRate: number }
+export interface Transaction { id: string; userId: string; creditLineId: string; lenderId: string; merchantName: string; amount: number; mode: TxMode; channel: "UPI" | "BNPL" | "CARD"; status: TxStatus; pendingSince?: string; settledAt?: string; cancelledAt?: string; createdAt: string; routingAttempts?: RoutingAttempt[] }
 export interface RiskSignal { name: string; weight: number; score: number; description: string }
 export interface RiskAssessment { id: string; userId: string; recommendedLimit: number; tier: LimitTier; signals: RiskSignal[]; compositeScore: number; createdAt: string }
 export interface Statement { id: string; userId: string; periodStart: string; periodEnd: string; totalDue: number; minimumDue: number; dueDate: string; status: "OPEN" | "CLOSED" | "PAID"; items?: StatementLineItem[] }

@@ -1,6 +1,13 @@
 import { Hono } from "npm:hono";
 import { cors } from "npm:hono/cors";
 import * as kv from "./kv_store.tsx";
+import {
+  buildDefaultRules,
+  CreditLineView,
+  HistoricalTransaction,
+  RiskEnforcementGateway,
+  TransactionRequest as EnforcementRequest,
+} from "./risk_enforcement.ts";
 
 const app = new Hono();
 const P = "/make-server-f415469b"; // route prefix
@@ -12,9 +19,9 @@ app.use("/*", cors({ origin: "*", allowHeaders: ["Content-Type", "Authorization"
 type LimitTier = "INSUFFICIENT_DATA" | "LOW" | "MEDIUM" | "HIGH";
 type TxStatus = "INITIATED" | "PENDING_CONFIRMATION" | "SETTLED" | "CANCELLED" | "EXPIRED_AUTO_SETTLED";
 type TxMode = "OWN_MONEY" | "CREDIT_LINE";
-type TxChannel = "UPI" | "BNPL";
+type TxChannel = "UPI" | "BNPL" | "CARD";
 type ConsentStatus = "ACTIVE" | "REVOKED";
-type ClStatus = "ACTIVE" | "SUSPENDED";
+type ClStatus = "ACTIVE" | "SUSPENDED" | "CLOSED";
 
 interface User { id: string; name: string; upiVpa: string; kycStatus: string; createdAt: string }
 interface Lender { id: string; name: string; type: "BANK" | "NBFC"; maxTxAmount: number; priority: number }
@@ -241,28 +248,85 @@ app.get(`${P}/consent/check`, async (c) => {
   return c.json({ valid: true, consent });
 });
 
-// ── Module 3: Unified Enforcement ────────────────────────────────────────────
+// ── Module 3: Unified Risk Enforcement ────────────────────────────────────────
+//
+// THIS IS THE ONLY PLACE limit/risk rules are enforced.
+// Settlement (Feature 04), BNPL (Feature 08), and any future payment channel
+// MUST call buildGateway() and invoke gateway.enforce() — never implement
+// their own limit check inline.
+// See risk_enforcement.ts for rule implementations and design rationale.
+
+/**
+ * Builds a fully-wired RiskEnforcementGateway connected to KV.
+ *
+ * Extracted as a shared helper so every credit-consuming channel
+ * (/enforce, /bnpl/create-schedule, and future routes) can call the
+ * gateway without duplicating the KV wiring. The gateway itself (and the
+ * rules inside it) remains unchanged — this is only the adapter layer.
+ */
+function buildGateway(): RiskEnforcementGateway {
+  const consentChecker = {
+    isConsentValid: async (uid: string, clId: string): Promise<boolean> => {
+      const consent: ConsentRecord | null = await kv.get(`consent:active:${uid}:${clId}`);
+      if (!consent || consent.status !== "ACTIVE") return false;
+      if (new Date(consent.expiresAt) < new Date()) return false;
+      return true;
+    },
+  };
+
+  const getRecentTransactions = async (uid: string, windowDays: number): Promise<HistoricalTransaction[]> => {
+    const txs: Transaction[] = await kv.get(`transactions:u:${uid}`) ?? [];
+    const cutoff = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+    return txs
+      .filter((t) => t.status === "SETTLED" && new Date(t.createdAt).getTime() >= cutoff)
+      .map((t) => ({ merchantId: t.merchantName, amount: t.amount, createdAt: t.createdAt }));
+  };
+
+  const getCreditLineView = async (clId: string): Promise<CreditLineView | null> => {
+    const cl = await getCreditLine(clId);
+    if (!cl) return null;
+    return {
+      id: cl.id,
+      userId: cl.userId,
+      limit: cl.limit,
+      utilized: cl.utilized,
+      heldAmount: cl.heldAmount,
+      status: cl.status,
+      // allowedChannels not present on legacy records → undefined = all permitted
+      allowedChannels: (cl as any).allowedChannels,
+    };
+  };
+
+  const rules = buildDefaultRules(consentChecker, getRecentTransactions);
+  return new RiskEnforcementGateway(rules, getCreditLineView);
+}
 
 app.post(`${P}/enforce`, async (c) => {
-  const { userId, creditLineId, amount, channel } = await c.req.json();
-  // Fail closed — any missing param = declined
-  if (!userId || !creditLineId || !amount) return c.json({ approved: false, reason: "Incomplete request" });
+  const { userId, creditLineId, amount, channel, merchantId } = await c.req.json();
 
-  const [consentRes, cl] = await Promise.all([
-    kv.get(`consent:active:${userId}:${creditLineId}`) as Promise<ConsentRecord | null>,
-    getCreditLine(creditLineId),
-  ]);
+  // Fail closed — any missing param = declined before reaching the gateway
+  if (!userId || !creditLineId || !amount) {
+    return c.json({ approved: false, reason: "Incomplete request: userId, creditLineId, and amount are required" });
+  }
 
-  if (!consentRes || consentRes.status !== "ACTIVE") return c.json({ approved: false, reason: "No valid consent for this credit line" });
-  if (new Date(consentRes.expiresAt) < new Date()) return c.json({ approved: false, reason: "Consent expired" });
-  if (!cl) return c.json({ approved: false, reason: "Credit line not found" });
-  if (cl.status !== "ACTIVE") return c.json({ approved: false, reason: "Credit line is suspended" });
-  if (cl.userId !== userId) return c.json({ approved: false, reason: "Credit line mismatch" });
+  const req: EnforcementRequest = {
+    userId,
+    creditLineId,
+    amount,
+    channel: (channel ?? "UPI") as TxChannel,
+    merchantId: merchantId ?? "unknown",
+  };
 
-  const available = cl.limit - cl.utilized - cl.heldAmount;
-  if (amount > available) return c.json({ approved: false, reason: "Limit reached for this cycle. Repay early to free up room.", available });
-  if (channel === "BNPL" && amount < 500) return c.json({ approved: false, reason: "BNPL minimum is ₹500" });
+  const enforcement = await buildGateway().enforce(req);
 
+  if (enforcement.status === "DECLINED") {
+    await audit(userId, "ENFORCEMENT_DECLINED", "CreditLine", creditLineId, enforcement.reason);
+    return c.json({ approved: false, reason: enforcement.reason });
+  }
+
+  // Approved — return available limit and credit line for callers that need it
+  const cl = await getCreditLine(creditLineId);
+  const available = cl ? cl.limit - cl.utilized - cl.heldAmount : 0;
   return c.json({ approved: true, available, cl });
 });
 
@@ -515,8 +579,29 @@ app.post(`${P}/bnpl/plans`, async (c) => {
 
 app.post(`${P}/bnpl/create-schedule`, async (c) => {
   const { userId, creditLineId, amount, merchantName, installments, idempotencyKey } = await c.req.json();
+  if (!userId || !creditLineId || !amount || !merchantName || !installments) {
+    return c.json({ error: "Missing required fields" }, 400);
+  }
 
-  // Run through full enforcement + routing first
+  // ── Step 1: Enforce via RiskEnforcementGateway (Feature 03) ────────────────
+  // BNPL authorization must pass through the same gate as every other
+  // credit-consuming channel. No separate BNPL risk or limit check here.
+  const enfReq: EnforcementRequest = {
+    userId,
+    creditLineId,
+    amount,
+    channel: "BNPL",
+    merchantId: merchantName, // merchantName is the merchant identifier in this model
+  };
+
+  const enforcement = await buildGateway().enforce(enfReq);
+
+  if (enforcement.status === "DECLINED") {
+    await audit(userId, "ENFORCEMENT_DECLINED", "CreditLine", creditLineId, enforcement.reason);
+    return c.json({ error: enforcement.reason, approved: false }, 422);
+  }
+
+  // ── Step 2: Proceed to BNPL transaction + schedule creation ────────────────
   const cl = await getCreditLine(creditLineId);
   if (!cl) return c.json({ error: "Credit line not found" }, 404);
 
