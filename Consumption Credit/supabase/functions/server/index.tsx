@@ -1,6 +1,13 @@
 import { Hono } from "npm:hono";
 import { cors } from "npm:hono/cors";
 import * as kv from "./kv_store.tsx";
+import {
+  buildDefaultRules,
+  CreditLineView,
+  HistoricalTransaction,
+  RiskEnforcementGateway,
+  TransactionRequest as EnforcementRequest,
+} from "./risk_enforcement.ts";
 
 const app = new Hono();
 const P = "/make-server-f415469b";
@@ -12,11 +19,9 @@ app.use("/*", cors({ origin: "*", allowHeaders: ["Content-Type", "Authorization"
 type LimitTier = "INSUFFICIENT_DATA" | "LOW" | "MEDIUM" | "HIGH";
 type TxStatus = "INITIATED" | "PENDING_CONFIRMATION" | "SETTLED" | "CANCELLED" | "EXPIRED_AUTO_SETTLED";
 type TxMode = "OWN_MONEY" | "CREDIT_LINE";
-type TxChannel = "UPI" | "BNPL";
+type TxChannel = "UPI" | "BNPL" | "CARD";
 type ConsentStatus = "ACTIVE" | "REVOKED";
-type ClStatus = "ACTIVE" | "SUSPENDED";
-type KycStatus = "UNVERIFIED" | "SIMULATED_VERIFIED";
-type NotifType = "OTP_SENT" | "KYC_VERIFIED" | "TX_SETTLED" | "TX_DECLINED" | "TX_CANCELLED" | "LIMIT_INCREASED" | "LIMIT_PROPOSAL" | "STATEMENT_GENERATED" | "CONSENT_GRANTED" | "GRIEVANCE_RAISED" | "GRIEVANCE_RESOLVED" | "COOLING_OFF_EXIT" | "MANDATE_SET";
+type ClStatus = "ACTIVE" | "SUSPENDED" | "CLOSED";
 
 interface User { id: string; phone: string; phoneVerifiedAt?: string; name: string; panNumberMasked?: string; kycStatus: KycStatus; upiVpa: string; createdAt: string; role?: "USER" | "ADMIN" }
 interface Lender { id: string; name: string; type: "BANK" | "NBFC"; maxTxAmount: number; priority: number }
@@ -412,7 +417,6 @@ app.post(`${P}/consent/grant`, async (c) => {
   await notify(userId, "CONSENT_GRANTED", "Consent granted", `You can now spend from your ${cl.lenderName} credit line.`, "granted");
   return c.json(consent);
 });
-
 app.post(`${P}/consent/revoke`, async (c) => {
   const userId = c.get("userId") as string;
   const { creditLineId } = await c.req.json();
@@ -436,21 +440,74 @@ app.get(`${P}/consent/check`, async (c) => {
   return c.json({ valid: true, consent });
 });
 
-// ── Module 3: Enforcement ─────────────────────────────────────────────────────
+// ── Module 3: Unified Enforcement ──────────────────────────────────────────────
+//
+// THIS IS THE ONLY PLACE limit/risk rules are enforced.
+// Settlement, BNPL, and all future payment channels MUST call
+// buildGateway().enforce() — never implement their own limit check inline.
+// See risk_enforcement.ts for rule implementations and design rationale.
+
+/**
+ * Builds a fully-wired RiskEnforcementGateway connected to KV.
+ * Shared by /enforce, /bnpl/create-schedule, and future payment routes.
+ */
+function buildGateway(): RiskEnforcementGateway {
+  const consentChecker = {
+    isConsentValid: async (uid: string, clId: string): Promise<boolean> => {
+      const consent: ConsentRecord | null = await kv.get(`consent:active:${uid}:${clId}`);
+      if (!consent || consent.status !== "ACTIVE") return false;
+      if (new Date(consent.expiresAt) < new Date()) return false;
+      return true;
+    },
+  };
+
+  const getRecentTransactions = async (uid: string, windowDays: number): Promise<HistoricalTransaction[]> => {
+    const txs: Transaction[] = await kv.get(`transactions:u:${uid}`) ?? [];
+    const cutoff = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+    return txs
+      .filter((t) => t.status === "SETTLED" && new Date(t.createdAt).getTime() >= cutoff)
+      .map((t) => ({ merchantId: t.merchantName, amount: t.amount, createdAt: t.createdAt }));
+  };
+
+  const getCreditLineView = async (clId: string): Promise<CreditLineView | null> => {
+    const cl = await getCreditLine(clId);
+    if (!cl) return null;
+    return {
+      id: cl.id, userId: cl.userId, limit: cl.limit,
+      utilized: cl.utilized, heldAmount: cl.heldAmount,
+      status: cl.status,
+      // allowedChannels not present on legacy records → undefined = all permitted
+      allowedChannels: (cl as any).allowedChannels,
+    };
+  };
+
+  const rules = buildDefaultRules(consentChecker, getRecentTransactions);
+  return new RiskEnforcementGateway(rules, getCreditLineView);
+}
 
 app.post(`${P}/enforce`, async (c) => {
-  const userId = c.get("userId") as string;
-  const { creditLineId, amount, channel } = await c.req.json();
-  if (!creditLineId || !amount) return c.json({ approved: false, reason: "Incomplete request" });
-  const [consentRes, cl] = await Promise.all([kv.get(`consent:active:${userId}:${creditLineId}`) as Promise<ConsentRecord | null>, getCreditLine(creditLineId)]);
-  if (!consentRes || consentRes.status !== "ACTIVE") return c.json({ approved: false, reason: "No valid consent for this credit line" });
-  if (new Date(consentRes.expiresAt) < new Date()) return c.json({ approved: false, reason: "Consent expired" });
-  if (!cl) return c.json({ approved: false, reason: "Credit line not found" });
-  if (cl.status !== "ACTIVE") return c.json({ approved: false, reason: "Credit line is suspended" });
-  if (cl.userId !== userId) return c.json({ approved: false, reason: "Credit line mismatch" });
-  const available = cl.limit - cl.utilized - cl.heldAmount;
-  if (amount > available) return c.json({ approved: false, reason: "Limit reached for this cycle. Repay early to free up room.", available });
-  if (channel === "BNPL" && amount < 500) return c.json({ approved: false, reason: "BNPL minimum is ₹500" });
+  const { userId, creditLineId, amount, channel, merchantId } = await c.req.json();
+  // Fail closed — any missing param = declined before reaching the gateway
+  if (!userId || !creditLineId || !amount) {
+    return c.json({ approved: false, reason: "Incomplete request: userId, creditLineId, and amount are required" });
+  }
+
+  const req: EnforcementRequest = {
+    userId, creditLineId, amount,
+    channel: (channel ?? "UPI") as TxChannel,
+    merchantId: merchantId ?? "unknown",
+  };
+
+  const enforcement = await buildGateway().enforce(req);
+
+  if (enforcement.status === "DECLINED") {
+    await audit(userId, "ENFORCEMENT_DECLINED", "CreditLine", creditLineId, enforcement.reason);
+    return c.json({ approved: false, reason: enforcement.reason });
+  }
+
+  // Approved — return available limit and credit line for callers that need it
+  const cl = await getCreditLine(creditLineId);
+  const available = cl ? cl.limit - cl.utilized - cl.heldAmount : 0;
   return c.json({ approved: true, available, cl });
 });
 
@@ -658,23 +715,47 @@ app.post(`${P}/bnpl/plans`, async (c) => {
 });
 
 app.post(`${P}/bnpl/create-schedule`, async (c) => {
-  const userId = c.get("userId") as string;
-  const { creditLineId, amount, merchantName, installments, idempotencyKey } = await c.req.json();
+  const sessionUserId = c.get("userId") as string;
+  const { userId, creditLineId, amount, merchantName, installments, idempotencyKey } = await c.req.json();
+  const effectiveUserId = sessionUserId || userId; // support both session and explicit userId
+  if (!effectiveUserId || !creditLineId || !amount || !merchantName || !installments) {
+    return c.json({ error: { code: "MISSING_FIELDS", message: "Missing required fields" } }, 400);
+  }
+
+  // ── Step 1: Enforce via RiskEnforcementGateway (Feature 03) ────────────────
+  // BNPL authorization passes through the same gate as every other channel.
+  // No separate BNPL risk or limit check here.
+  const enfReq: EnforcementRequest = {
+    userId: effectiveUserId,
+    creditLineId,
+    amount,
+    channel: "BNPL",
+    merchantId: merchantName,
+  };
+
+  const enforcement = await buildGateway().enforce(enfReq);
+
+  if (enforcement.status === "DECLINED") {
+    await audit(effectiveUserId, "ENFORCEMENT_DECLINED", "CreditLine", creditLineId, enforcement.reason);
+    return c.json({ error: enforcement.reason, approved: false }, 422);
+  }
+
+  // ── Step 2: Proceed to BNPL transaction + schedule creation ────────────────
   const cl = await getCreditLine(creditLineId);
-  if (!cl || cl.userId !== userId) return c.json({ error: { code: "NOT_FOUND", message: "Credit line not found" } }, 404);
+  if (!cl || cl.userId !== effectiveUserId) return c.json({ error: { code: "NOT_FOUND", message: "Credit line not found" } }, 404);
   const monthlyRate = cl.interestRate / 12;
   const interest = Math.round(amount * monthlyRate * installments);
   const perInstallment = Math.ceil((amount + interest) / installments);
-  const tx: Transaction = { id: uid(), userId, creditLineId, lenderId: cl.lenderId, merchantName, amount, mode: "CREDIT_LINE", channel: "BNPL", status: "SETTLED", settledAt: now(), idempotencyKey, createdAt: now() };
+  const tx: Transaction = { id: uid(), userId: effectiveUserId, creditLineId, lenderId: cl.lenderId, merchantName, amount, mode: "CREDIT_LINE", channel: "BNPL", status: "SETTLED", settledAt: now(), idempotencyKey, createdAt: now() };
   await saveCreditLine({ ...cl, utilized: cl.utilized + amount });
   const schedule: InstallmentItem[] = Array.from({ length: installments }).map((_, i) => { const d = new Date(); d.setMonth(d.getMonth() + i + 1, 5); return { seq: i + 1, dueDate: d.toISOString(), amount: perInstallment, status: "SCHEDULED" }; });
-  const instSchedule: InstallmentSchedule = { id: uid(), transactionId: tx.id, userId, creditLineId, installments: schedule };
+  const instSchedule: InstallmentSchedule = { id: uid(), transactionId: tx.id, userId: effectiveUserId, creditLineId, installments: schedule };
   await kv.set(`installment:${instSchedule.id}`, instSchedule);
   await kv.set(`installment:tx:${tx.id}`, instSchedule);
   await saveTransaction(tx);
   await appendLineItem(tx, cl);
-  await audit(userId, "BNPL_CREATED", "Transaction", tx.id, `₹${amount} BNPL over ${installments} installments at ${merchantName}`);
-  await notify(userId, "TX_SETTLED", "BNPL created", `₹${amount.toLocaleString("en-IN")} split into ${installments} × ₹${perInstallment.toLocaleString("en-IN")} at ${merchantName}.`, "settled");
+  await audit(effectiveUserId, "BNPL_CREATED", "Transaction", tx.id, `₹${amount} BNPL over ${installments} installments at ${merchantName}`);
+  await notify(effectiveUserId, "TX_SETTLED", "BNPL created", `₹${amount.toLocaleString("en-IN")} split into ${installments} × ₹${perInstallment.toLocaleString("en-IN")} at ${merchantName}.`, "settled");
   return c.json({ transaction: tx, schedule: instSchedule });
 });
 
@@ -1001,12 +1082,12 @@ app.get(`${P}/billing/statement/:id/pdf`, async (c) => {
   <div class="sub">Statement · ${user?.name ?? userId} · ${user?.upiVpa ?? ""}</div>
   <hr class="rule">
   <div class="totals">
-    <div><div class="tot-label">Total due</div><div class="tot-val" style="color:#A8532E">₹${stmt.totalDue.toLocaleString("en-IN")}</div><div style="font-size:10px;color:#8B7355;margin-top:3px">Due ${new Date(stmt.dueDate).toLocaleDateString("en-IN",{day:"numeric",month:"short",year:"numeric"})}</div></div>
+    <div><div class="tot-label">Total due</div><div class="tot-val" style="color:#A8532E">₹${stmt.totalDue.toLocaleString("en-IN")}</div><div style="font-size:10px;color:#8B7355;margin-top:3px">Due ${new Date(stmt.dueDate).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}</div></div>
     <div><div class="tot-label">Minimum due</div><div class="tot-val">₹${stmt.minimumDue.toLocaleString("en-IN")}</div><div style="font-size:10px;color:#8B7355;margin-top:3px">${stmt.status}</div></div>
   </div>
   <hr class="rule">
   <table><thead><tr><th class="date">Date</th><th>Description</th><th>Lender</th><th style="text-align:right">Amount</th></tr></thead><tbody>
-  ${items.map(i => `<tr><td class="date">${new Date(i.date).toLocaleDateString("en-IN",{day:"numeric",month:"short"})}</td><td>${i.description}</td><td style="color:#8B7355;font-size:11px">${i.lenderName}</td><td class="amt">₹${i.amount.toLocaleString("en-IN")}</td></tr>`).join("")}
+  ${items.map(i => `<tr><td class="date">${new Date(i.date).toLocaleDateString("en-IN", { day: "numeric", month: "short" })}</td><td>${i.description}</td><td style="color:#8B7355;font-size:11px">${i.lenderName}</td><td class="amt">₹${i.amount.toLocaleString("en-IN")}</td></tr>`).join("")}
   </tbody></table>
   <div class="footer">Period: ${new Date(stmt.periodStart).toLocaleDateString("en-IN")} – ${new Date(stmt.periodEnd).toLocaleDateString("en-IN")}<br>This is a computer-generated statement. ConsumptionCredit — DEMO. Not a regulated financial instrument.</div>
   <script>window.onload=()=>window.print()</script>
